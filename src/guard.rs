@@ -1,10 +1,11 @@
-use ignore::WalkBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use walkdir::WalkDir;
 
 const SENSITIVE_NAMES: &[&str] = &[
     ".env",
@@ -124,34 +125,60 @@ fn backup_path(original: &Path) -> PathBuf {
     backup_root().join(stripped)
 }
 
-/// Walk avec deux couches de filtrage :
-/// 1. **`.gitignore`-aware** via la crate `ignore` (la même que ripgrep) :
-///    on respecte `.gitignore`, `.git/info/exclude`, le global gitignore et
-///    les `.ignore`. Si le projet ignore `.venv/` dans son gitignore, on le
-///    skippe automatiquement sans avoir à le coder en dur.
-/// 2. **`SKIP_DIRS` en filet de sécurité** : si le projet n'a pas de gitignore
-///    (ou s'il a oublié d'ignorer `.venv`), on skippe quand même les répertoires
-///    notoirement dangereux. Defense in depth.
+/// Charge le `.gitignore` racine du projet, s'il existe. Renvoie None si
+/// pas de gitignore — dans ce cas seul `SKIP_DIRS` filtre.
+fn load_root_gitignore(dir: &Path) -> Option<Gitignore> {
+    let gi_path = dir.join(".gitignore");
+    if !gi_path.exists() {
+        return None;
+    }
+    let mut builder = GitignoreBuilder::new(dir);
+    builder.add(&gi_path);
+    builder.build().ok()
+}
+
+/// Walk avec **trois couches de filtrage**, dans cet ordre :
+///
+/// 1. **`SKIP_DIRS` (hard-coded)** — defense in depth, skippe `.venv`,
+///    `node_modules`, `.git`, etc. même si pas de gitignore.
+/// 2. **`.gitignore` racine** — appliqué **uniquement aux dossiers**.
+///    Si le projet ignore `target/` ou `dist/`, on n'y descend pas.
+/// 3. **Fichiers sensibles toujours visibles** — un fichier qui matche
+///    `is_sensitive()` est retourné par l'itérateur **même s'il est gitignored**.
+///    C'est le cas typique de `.env` qui est presque toujours dans `.gitignore`
+///    mais qu'on doit absolument redacter.
+///
+/// Note : on ne suit pas les symlinks (`follow_links(false)`) pour éviter
+/// les boucles infinies et les redactions accidentelles hors du projet.
 fn iter_files(dir: &Path) -> impl Iterator<Item = PathBuf> {
-    WalkBuilder::new(dir)
+    let gitignore = load_root_gitignore(dir);
+
+    WalkDir::new(dir)
         .follow_links(false)
-        .hidden(false) // on veut toujours voir .env, .envrc, etc.
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
-        .ignore(true)
-        .filter_entry(|e| {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let name = e.file_name().to_string_lossy();
-                !SKIP_DIRS.contains(&name.as_ref())
-            } else {
-                true
+        .into_iter()
+        .filter_entry(move |e| {
+            if !e.file_type().is_dir() {
+                return true;
             }
+            let name = e.file_name().to_string_lossy();
+            // Couche 1 : SKIP_DIRS
+            if SKIP_DIRS.contains(&name.as_ref()) {
+                return false;
+            }
+            // Couche 2 : gitignore (sur les dossiers seulement)
+            if let Some(gi) = &gitignore {
+                if gi.matched(e.path(), true).is_ignore() {
+                    return false;
+                }
+            }
+            true
         })
-        .build()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
+    // Couche 3 : pas de filtre fichier ici. C'est le caller (`redact`) qui
+    // appelle `is_sensitive()` — donc tout fichier sensible passe quel que
+    // soit son statut gitignore.
 }
 
 fn is_binary_secret(path: &Path) -> bool {
