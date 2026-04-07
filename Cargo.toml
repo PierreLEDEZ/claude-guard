@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 sysinfo     = "0.33"
 walkdir     = "2.5"
+ignore      = "0.4"
 anyhow      = "1"
 chrono      = "0.4"
 ratatui     = "0.29"

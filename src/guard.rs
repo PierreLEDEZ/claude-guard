@@ -1,10 +1,10 @@
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use walkdir::WalkDir;
 
 const SENSITIVE_NAMES: &[&str] = &[
     ".env",
@@ -124,23 +124,33 @@ fn backup_path(original: &Path) -> PathBuf {
     backup_root().join(stripped)
 }
 
-/// WalkDir avec filtrage des `SKIP_DIRS`. Le filter sur `into_iter()` skip
-/// les répertoires ENTIERS avant qu'on y descende, ce qui évite de scanner
-/// des milliers de fichiers dans `node_modules`/`.venv`.
+/// Walk avec deux couches de filtrage :
+/// 1. **`.gitignore`-aware** via la crate `ignore` (la même que ripgrep) :
+///    on respecte `.gitignore`, `.git/info/exclude`, le global gitignore et
+///    les `.ignore`. Si le projet ignore `.venv/` dans son gitignore, on le
+///    skippe automatiquement sans avoir à le coder en dur.
+/// 2. **`SKIP_DIRS` en filet de sécurité** : si le projet n'a pas de gitignore
+///    (ou s'il a oublié d'ignorer `.venv`), on skippe quand même les répertoires
+///    notoirement dangereux. Defense in depth.
 fn iter_files(dir: &Path) -> impl Iterator<Item = PathBuf> {
-    WalkDir::new(dir)
+    WalkBuilder::new(dir)
         .follow_links(false)
-        .into_iter()
+        .hidden(false) // on veut toujours voir .env, .envrc, etc.
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .ignore(true)
         .filter_entry(|e| {
-            if e.file_type().is_dir() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = e.file_name().to_string_lossy();
                 !SKIP_DIRS.contains(&name.as_ref())
             } else {
                 true
             }
         })
+        .build()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|e| e.into_path())
 }
 
